@@ -30,6 +30,7 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rspec-rails", "~> 6.0"
   spec.add_development_dependency "factory_bot_rails", "~> 6.0"
   spec.add_development_dependency "webmock", "~> 3.0"
+  spec.add_development_dependency "sqlite3", "~> 2.1"
 
   spec.required_ruby_version = ">= 3.0.0"
 end

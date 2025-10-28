@@ -14,9 +14,11 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   end
   let(:provider) { described_class.new(project) }
   let(:k8s_client) { instance_double(K8s::Client) }
+  let(:logger) { instance_double(Logger, info: nil, warn: nil, error: nil, debug: nil) }
 
   before do
     allow(provider).to receive(:k8s_client).and_return(k8s_client)
+    allow(Rails).to receive(:logger).and_return(logger)
   end
 
   describe "interface compliance" do
@@ -97,8 +99,8 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   describe "#stop_worker" do
     let(:machine) { create(:machine, provider: 'kubernetes', uid: 'test-pod-123') }
     let(:worker) { create(:worker, project: project, machine: machine) }
-    let(:pods_resource) { instance_double(K8s::Resource) }
-    let(:v1_api) { instance_double(K8s::API) }
+    let(:pods_resource) { double('K8s::Resource') }
+    let(:v1_api) { double('K8s::API') }
 
     before do
       allow(k8s_client).to receive(:api).with('v1').and_return(v1_api)
@@ -115,13 +117,17 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
     end
 
     it "handles not found errors gracefully" do
-      allow(pods_resource).to receive(:delete).and_raise(K8s::Error::NotFound.new(404, 'Not Found', {}))
+      allow(pods_resource).to receive(:delete).and_raise(
+        K8s::Error::NotFound.new('DELETE', '/pods/test-pod-123', 404, 'Not Found')
+      )
 
       expect { provider.stop_worker(worker) }.not_to raise_error
     end
 
     it "raises ProviderError for other API errors" do
-      allow(pods_resource).to receive(:delete).and_raise(K8s::Error::API.new(500, 'Server Error', {}))
+      allow(pods_resource).to receive(:delete).and_raise(
+        K8s::Error::API.new('DELETE', '/pods/test-pod-123', 500, 'Server Error')
+      )
 
       expect { provider.stop_worker(worker) }.to raise_error(::Providers::ProviderError, /Failed to stop pod/)
     end
@@ -130,8 +136,8 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   describe "#destroy_worker" do
     let(:machine) { create(:machine, provider: 'kubernetes', uid: 'test-pod-456') }
     let(:worker) { create(:worker, project: project, machine: machine) }
-    let(:pods_resource) { instance_double(K8s::Resource) }
-    let(:v1_api) { instance_double(K8s::API) }
+    let(:pods_resource) { double('K8s::Resource') }
+    let(:v1_api) { double('K8s::API') }
 
     before do
       allow(k8s_client).to receive(:api).with('v1').and_return(v1_api)
@@ -158,8 +164,8 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   end
 
   describe "#reconcile_workers" do
-    let(:pods_resource) { instance_double(K8s::Resource) }
-    let(:v1_api) { instance_double(K8s::API) }
+    let(:pods_resource) { double('K8s::Resource') }
+    let(:v1_api) { double('K8s::API') }
     let(:pod1) { double(metadata: double(name: 'pod-1')) }
     let(:pod2) { double(metadata: double(name: 'pod-2')) }
     let(:pod3) { double(metadata: double(name: 'pod-orphaned')) }
@@ -184,7 +190,9 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
     end
 
     it "handles API errors gracefully" do
-      allow(pods_resource).to receive(:list).and_raise(K8s::Error::API.new(500, 'Error', {}))
+      allow(pods_resource).to receive(:list).and_raise(
+        K8s::Error::API.new('GET', '/pods', 500, 'Error')
+      )
 
       expect { provider.reconcile_workers }.not_to raise_error
     end
@@ -194,7 +202,7 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
     it "logs debug message" do
       workers = [create(:worker, project: project)]
 
-      expect(Rails.logger).to receive(:debug).with(/K8s.*1 workers allocated/)
+      expect(logger).to receive(:debug).with(/K8s.*1 workers allocated/)
       provider.after_worker_allocated(workers)
     end
   end
@@ -203,7 +211,7 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
     let(:worker) { create(:worker, project: project) }
 
     it "logs info message" do
-      expect(Rails.logger).to receive(:info).with(/K8s.*Scheduling cleanup/)
+      expect(logger).to receive(:info).with(/K8s.*Scheduling cleanup/)
       provider.after_worker_freed(worker)
     end
   end
