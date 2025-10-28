@@ -8,12 +8,12 @@ FactoryBot.define do
   end
 
   factory :worker do
-    association :project
-    association :machine, factory: :machine, strategy: :build
+    project
+    association :machine, strategy: :build
   end
 
   factory :machine do
-    association :project
+    project
     provider { 'kubernetes' }
     uid { "pod-#{SecureRandom.hex(6)}" }
     state { 'running' }

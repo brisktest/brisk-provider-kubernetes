@@ -10,29 +10,31 @@ require 'active_support/all'
 require 'logger'
 
 # Set up a minimal Rails stub
-module Rails
-  def self.logger
-    @logger ||= Logger.new(STDOUT).tap do |log|
-      log.level = Logger::ERROR
+unless defined?(Rails)
+  module Rails
+    def self.logger
+      @logger ||= Logger.new($stdout).tap do |log|
+        log.level = Logger::ERROR
+      end
+    end
+
+    def self.root
+      Pathname.new(File.expand_path('../..', __dir__))
+    end
+
+    def self.env
+      ActiveSupport::StringInquirer.new(ENV['RAILS_ENV'] || 'test')
+    end
+
+    def self.application
+      self
+    end
+
+    def self.config
+      @config ||= Struct.new(:eager_load).new(false)
     end
   end
-
-  def self.root
-    Pathname.new(File.expand_path('../..', __dir__))
-  end
-
-  def self.env
-    ActiveSupport::StringInquirer.new(ENV['RAILS_ENV'] || 'test')
-  end
-
-  def self.application
-    self
-  end
-
-  def self.config
-    @config ||= Struct.new(:eager_load).new(false)
-  end
-end unless defined?(Rails)
+end
 
 # Configure in-memory SQLite database
 ActiveRecord::Base.establish_connection(
@@ -83,7 +85,7 @@ module Providers
       raise NotImplementedError
     end
 
-    def supports?(feature)
+    def supports?(_feature)
       false
     end
 
@@ -95,15 +97,15 @@ module Providers
       # Hook for post-free logic
     end
 
-    def should_track_health?(worker)
+    def should_track_health?(_worker)
       true
     end
 
-    def register_worker_metadata(worker, params)
+    def register_worker_metadata(_worker, _params)
       {}
     end
 
-    def manages_machine?(machine)
+    def manages_machine?(_machine)
       false
     end
   end
@@ -121,7 +123,8 @@ class Project < ActiveRecord::Base
   # Mock the image method that returns an object with url
   def image
     return nil if attributes['image'].nil?
-    @image_obj ||= Struct.new(:url).new(attributes['image'])
+
+    @image ||= Struct.new(:url).new(attributes['image'])
   end
 
   def worker_concurrency
@@ -171,7 +174,7 @@ RSpec.configure do |config|
     FactoryBot.find_definitions
   end
 
-  config.around(:each) do |example|
+  config.around do |example|
     ActiveRecord::Base.transaction do
       example.run
       raise ActiveRecord::Rollback

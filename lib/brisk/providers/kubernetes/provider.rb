@@ -125,7 +125,7 @@ module Brisk
           known_uids = project.machines.where(provider: 'kubernetes').pluck(:uid)
 
           # Delete orphaned pods
-          orphaned = pods.select { |pod| !known_uids.include?(pod.metadata.name) }
+          orphaned = pods.reject { |pod| known_uids.include?(pod.metadata.name) }
           orphaned.each do |pod|
             Rails.logger.info "[K8s] Deleting orphaned pod: #{pod.metadata.name}"
             client.api('v1').resource('pods', namespace: namespace).delete(
@@ -143,18 +143,8 @@ module Brisk
         # @param feature [Symbol] Feature name
         # @return [Boolean] Whether feature is supported
         def supports?(feature)
-          case feature
-          when :dynamic_creation
-            true # Can create pods on-demand
-          when :suspend
-            false # Kubernetes doesn't have suspend, we stop instead
-          when :auto_scale
-            true # Can use HPA (Horizontal Pod Autoscaler)
-          when :spot_instances
-            false # Not applicable to Kubernetes
-          else
-            false
-          end
+          # Can create pods on-demand and use HPA (Horizontal Pod Autoscaler)
+          %i[dynamic_creation auto_scale].include?(feature)
         end
 
         # Called after workers are allocated
@@ -178,7 +168,7 @@ module Brisk
         # Kubernetes manages pod health via liveness/readiness probes
         # @param worker [Worker] The worker
         # @return [Boolean] false - Kubernetes manages health
-        def should_track_health?(worker)
+        def should_track_health?(_worker)
           false
         end
 
@@ -186,7 +176,7 @@ module Brisk
         # @param worker [Worker] The worker
         # @param params [Hash] Registration parameters
         # @return [Hash] Metadata to set on worker
-        def register_worker_metadata(worker, params)
+        def register_worker_metadata(_worker, _params)
           {
             last_checked_at: 10.years.from_now # Kubernetes manages health
           }
@@ -196,7 +186,7 @@ module Brisk
         # @param machine [Machine] The machine
         # @return [Boolean] true if machine is a Kubernetes pod
         def manages_machine?(machine)
-          machine.provider == "kubernetes"
+          machine.provider == 'kubernetes'
         end
 
         private
@@ -243,14 +233,12 @@ module Brisk
           # Ensure namespace exists or can be created
           namespace = k8s_namespace
 
-          unless namespace.present?
-            raise ::Providers::ConfigurationError, "Kubernetes namespace not configured"
-          end
+          raise ::Providers::ConfigurationError, 'Kubernetes namespace not configured' unless namespace.present?
 
           # Validate image is configured
-          unless project.image&.url.present?
-            raise ::Providers::ConfigurationError, "Worker image not configured"
-          end
+          return if project.image&.url.present?
+
+          raise ::Providers::ConfigurationError, 'Worker image not configured'
         end
       end
     end

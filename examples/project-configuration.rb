@@ -1,9 +1,11 @@
+# frozen_string_literal: true
+
 # Example project configurations for Kubernetes provider
 
 # Basic configuration with defaults
-basic_project = Project.create!(
-  name: "Basic K8s Project",
-  framework: "Jest",
+Project.create!(
+  name: 'Basic K8s Project',
+  framework: 'Jest',
   worker_provider: 'kubernetes',
   worker_concurrency: 5,
   provider_config: {
@@ -12,9 +14,9 @@ basic_project = Project.create!(
 )
 
 # Advanced configuration with custom resources
-advanced_project = Project.create!(
-  name: "Advanced K8s Project",
-  framework: "RSpec",
+Project.create!(
+  name: 'Advanced K8s Project',
+  framework: 'RSpec',
   worker_provider: 'kubernetes',
   worker_concurrency: 10,
   provider_config: {
@@ -22,8 +24,8 @@ advanced_project = Project.create!(
     'namespace' => 'brisk-production',
 
     # Resource configuration
-    'default_memory_mb' => 8192,  # 8GB RAM per worker
-    'default_cpu_count' => 4,      # 4 CPUs per worker
+    'default_memory_mb' => 8192, # 8GB RAM per worker
+    'default_cpu_count' => 4, # 4 CPUs per worker
 
     # Custom environment variables
     'env' => {
@@ -58,14 +60,14 @@ advanced_project = Project.create!(
 )
 
 # GPU-enabled workers
-gpu_project = Project.create!(
-  name: "GPU ML Tests",
-  framework: "Python",
+Project.create!(
+  name: 'GPU ML Tests',
+  framework: 'Python',
   worker_provider: 'kubernetes',
   worker_concurrency: 2,
   provider_config: {
     'namespace' => 'brisk-ml',
-    'default_memory_mb' => 16384,  # 16GB RAM
+    'default_memory_mb' => 16_384, # 16GB RAM
     'default_cpu_count' => 8,
 
     # Select GPU nodes
@@ -90,14 +92,14 @@ gpu_project = Project.create!(
 )
 
 # High-memory workers for integration tests
-integration_project = Project.create!(
-  name: "Integration Tests",
-  framework: "Rails",
+Project.create!(
+  name: 'Integration Tests',
+  framework: 'Rails',
   worker_provider: 'kubernetes',
   worker_concurrency: 3,
   provider_config: {
     'namespace' => 'brisk-integration',
-    'default_memory_mb' => 32768,  # 32GB RAM for databases
+    'default_memory_mb' => 32_768, # 32GB RAM for databases
     'default_cpu_count' => 8,
 
     'node_selector' => {
@@ -113,9 +115,9 @@ integration_project = Project.create!(
 )
 
 # Spot instance workers for cost savings
-spot_project = Project.create!(
-  name: "Spot Instance Project",
-  framework: "Cypress",
+Project.create!(
+  name: 'Spot Instance Project',
+  framework: 'Cypress',
   worker_provider: 'kubernetes',
   worker_concurrency: 20,
   provider_config: {
@@ -125,7 +127,7 @@ spot_project = Project.create!(
 
     # Target spot instances
     'node_selector' => {
-      'karpenter.sh/capacity-type' => 'spot'  # For Karpenter
+      'karpenter.sh/capacity-type' => 'spot' # For Karpenter
     },
 
     # Tolerate spot instance evictions
@@ -141,14 +143,14 @@ spot_project = Project.create!(
 )
 
 # Development/staging environment
-dev_project = Project.create!(
-  name: "Development Tests",
-  framework: "Jest",
+Project.create!(
+  name: 'Development Tests',
+  framework: 'Jest',
   worker_provider: 'kubernetes',
   worker_concurrency: 2,
   provider_config: {
     'namespace' => 'brisk-dev',
-    'default_memory_mb' => 2048,  # Smaller resources for dev
+    'default_memory_mb' => 2048, # Smaller resources for dev
     'default_cpu_count' => 1,
 
     'env' => {
@@ -159,7 +161,7 @@ dev_project = Project.create!(
 )
 
 # Update existing project to use Kubernetes
-existing_project = Project.find_by(name: "My Project")
+existing_project = Project.find_by(name: 'My Project')
 existing_project.update!(
   worker_provider: 'kubernetes',
   provider_config: {

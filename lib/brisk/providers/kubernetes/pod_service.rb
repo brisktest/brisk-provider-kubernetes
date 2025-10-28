@@ -16,7 +16,7 @@ module Brisk
         # @param jobrun [Jobrun] The job run
         # @param workers_needed [Integer] Number of workers needed
         # @return [Array<Worker>] Array of workers
-        def get_workers_for_project(jobrun, workers_needed)
+        def get_workers_for_project(_jobrun, workers_needed)
           namespace = project.provider_config['namespace'] || 'brisk-workers'
 
           # Find available workers (pods in Ready state)
@@ -48,7 +48,7 @@ module Brisk
           pod_spec = build_pod_spec(pod_name, machine_config)
 
           Rails.logger.debug "[K8s] Creating pod: #{pod_name}"
-          pod = client.api('v1').resource('pods', namespace: namespace).create_resource(pod_spec)
+          client.api('v1').resource('pods', namespace: namespace).create_resource(pod_spec)
 
           # Wait for pod to get IP address (with timeout)
           pod = wait_for_pod_ip(namespace, pod_name, timeout: 30)
@@ -125,13 +125,9 @@ module Brisk
           loop do
             pod = client.api('v1').resource('pods', namespace: namespace).get(pod_name)
 
-            if pod.status.podIP.present?
-              return pod
-            end
+            return pod if pod.status.podIP.present?
 
-            if Time.current > deadline
-              raise ::Providers::ProviderError, "Timeout waiting for pod IP: #{pod_name}"
-            end
+            raise ::Providers::ProviderError, "Timeout waiting for pod IP: #{pod_name}" if Time.current > deadline
 
             sleep 1
           end
@@ -172,7 +168,7 @@ module Brisk
                   env: build_env_vars,
                   resources: build_resources(machine_config),
                   ports: [
-                    { name: 'grpc', containerPort: 50051, protocol: 'TCP' },
+                    { name: 'grpc', containerPort: 50_051, protocol: 'TCP' },
                     { name: 'health', containerPort: 8081, protocol: 'TCP' }
                   ],
                   livenessProbe: {
