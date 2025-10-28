@@ -1,0 +1,150 @@
+# Kubernetes RBAC configuration for Brisk Kubernetes Provider
+# Apply with: kubectl apply -f kubernetes-rbac.yaml
+
+---
+# Namespace for Brisk workers
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: brisk-workers
+  labels:
+    app: brisk
+    component: workers
+
+---
+# Service account for Brisk API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: brisk-api
+  namespace: brisk-system  # Assuming Brisk API runs here
+  labels:
+    app: brisk
+    component: api
+
+---
+# Role for managing worker pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: brisk-worker-manager
+  namespace: brisk-workers
+  labels:
+    app: brisk
+    component: rbac
+rules:
+# Pod management
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
+
+# Pod logs (for debugging)
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+
+# Pod status
+- apiGroups: [""]
+  resources: ["pods/status"]
+  verbs: ["get"]
+
+---
+# RoleBinding to grant permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: brisk-api-worker-manager
+  namespace: brisk-workers
+  labels:
+    app: brisk
+    component: rbac
+subjects:
+- kind: ServiceAccount
+  name: brisk-api
+  namespace: brisk-system
+roleRef:
+  kind: Role
+  name: brisk-worker-manager
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Optional: NetworkPolicy to restrict worker pod communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: brisk-worker-network-policy
+  namespace: brisk-workers
+  labels:
+    app: brisk
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: brisk-worker
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow health checks from within cluster
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8081
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow external API access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow Brisk API access
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: brisk-system
+    ports:
+    - protocol: TCP
+      port: 50051
+
+---
+# Optional: ResourceQuota to limit resource usage
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: brisk-worker-quota
+  namespace: brisk-workers
+  labels:
+    app: brisk
+    component: resource-management
+spec:
+  hard:
+    requests.cpu: "100"        # Max 100 CPUs total
+    requests.memory: "400Gi"   # Max 400GB RAM total
+    limits.cpu: "150"          # Max 150 CPUs with bursting
+    limits.memory: "600Gi"     # Max 600GB RAM with bursting
+    pods: "50"                 # Max 50 pods
+
+---
+# Optional: PodDisruptionBudget for worker pods
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: brisk-worker-pdb
+  namespace: brisk-workers
+  labels:
+    app: brisk
+    component: availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: brisk-worker
