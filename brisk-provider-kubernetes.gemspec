@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
-require_relative "lib/brisk-provider-kubernetes"
+# Only require the version file, not the entire library
+# (to avoid loading Rails dependency during gemspec evaluation)
+require_relative "lib/brisk/providers/kubernetes/version"
 
 Gem::Specification.new do |spec|
   spec.name        = "brisk-provider-kubernetes"
