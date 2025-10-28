@@ -46,3 +46,7 @@ Naming/FileName:
 # Allow development dependencies in gemspec
 Gemspec/DevelopmentDependencies:
   Enabled: false
+
+# Disable buggy Capybara cop
+Capybara/RSpec/PredicateMatcher:
+  Enabled: false
