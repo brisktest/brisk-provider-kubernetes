@@ -48,6 +48,7 @@ require 'factory_bot_rails'
 module Providers
   class ProviderError < StandardError; end
   class ConfigurationError < StandardError; end
+  class UnsupportedOperationError < StandardError; end
 
   class BaseProvider
     attr_reader :project
@@ -115,6 +116,13 @@ end
 require 'brisk-provider-kubernetes'
 
 # Define minimal ActiveRecord models for testing
+# Stub ProjectService for provider delegation
+class ProjectService
+  def self.get_workers_for_project(jobrun)
+    []
+  end
+end
+
 class Project < ActiveRecord::Base
   serialize :provider_config, coder: JSON
   has_many :machines
@@ -130,11 +138,23 @@ class Project < ActiveRecord::Base
   def worker_concurrency
     10 # Default for tests
   end
+
+  def balance_workers
+    # no-op in tests
+  end
 end
 
 class Worker < ActiveRecord::Base
   belongs_to :project
   belongs_to :machine, optional: true
+
+  def de_register!
+    update!(state: 'finished')
+  end
+
+  def finished?
+    state == 'finished'
+  end
 end
 
 class Machine < ActiveRecord::Base
@@ -153,6 +173,7 @@ ActiveRecord::Schema.define do
   create_table :workers, force: true do |t|
     t.integer :project_id
     t.integer :machine_id
+    t.string :state, default: 'active'
     t.timestamps
   end
 
