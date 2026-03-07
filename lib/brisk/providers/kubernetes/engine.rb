@@ -11,6 +11,7 @@ module Brisk
         # Auto-register provider when Rails boots
         initializer 'brisk_provider_kubernetes.register', before: :load_config_initializers do |app|
           app.config.to_prepare do
+            require_relative 'provider'
             if defined?(::Providers::ProviderRegistry)
               ::Providers::ProviderRegistry.instance.register(
                 'kubernetes',
