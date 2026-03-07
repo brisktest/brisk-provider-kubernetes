@@ -1,244 +1,231 @@
 # frozen_string_literal: true
 
-require 'k8s-ruby'
+require "cgi"
+require "json"
+require "net/http"
+require "openssl"
 
 module Brisk
   module Providers
     module Kubernetes
-      # Kubernetes provider for Brisk
-      # Manages workers as Kubernetes pods in a cluster
+      # Kubernetes-aware infrastructure provider
+      # Workers run as pods in the same cluster and self-register via gRPC.
+      # This provider adds auto-healing: before each worker allocation it checks
+      # the actual K8s pod status and resets any DB records that are stuck in a
+      # bad state (finished, freed_at nil, etc.) while the pod is still healthy.
       class Provider < ::Providers::BaseProvider
-        TRACER = defined?(MyAppTracer) ? MyAppTracer : nil
+        K8S_API_HOST = "https://kubernetes.default.svc"
+        TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
-        # Get workers for a project by finding available pods
-        # @param jobrun [Jobrun] The job run requesting workers
-        # @return [Array<Worker>] Array of allocated workers
         def get_workers_for_project(jobrun)
-          workers_needed = project.worker_concurrency
-          Rails.logger.info "[K8s] Getting #{workers_needed} workers for jobrun #{jobrun.id}"
-
-          service = Brisk::Providers::Kubernetes::PodService.new(project, k8s_client)
-          service.get_workers_for_project(jobrun, workers_needed)
+          heal_stuck_workers(jobrun)
+          ProjectService.get_workers_for_project(jobrun)
         end
 
-        # Create a new worker pod
-        # @param machine_config [Hash] Machine configuration
-        # @return [Machine] The created machine record
-        def create_worker(machine_config)
-          validate_config!
-
-          Rails.logger.info "[K8s] Creating worker pod with config: #{machine_config}"
-
-          service = Brisk::Providers::Kubernetes::PodService.new(project, k8s_client)
-          service.create_worker_pod(machine_config)
-        rescue K8s::Error::API => e
-          raise ::Providers::ProviderError, "Failed to create Kubernetes pod: #{e.message}"
+        def create_worker(_machine_config)
+          raise ::Providers::UnsupportedOperationError,
+                "Kubernetes workers are managed by the cluster Deployment. Scale the workers Deployment instead."
         end
 
-        # Start a worker pod (scale from 0 or unpause)
-        # @param worker [Worker] The worker to start
         def start_worker(worker)
-          Rails.logger.info "[K8s] Starting worker #{worker.id}"
-
-          pod_name = worker.machine.uid
-          namespace = k8s_namespace
-
-          # If pod is paused, resume it
-          # Otherwise, ensure it's running
-          client = k8s_client
-          pod = client.api('v1').resource('pods', namespace: namespace).get(pod_name)
-
-          unless pod.status.phase == 'Running'
-            # Restart pod by deleting and recreating
-            service = Brisk::Providers::Kubernetes::PodService.new(project, client)
-            service.restart_pod(worker)
-          end
-        rescue K8s::Error::NotFound
-          Rails.logger.warn "[K8s] Pod #{pod_name} not found, recreating"
-          create_worker(worker.machine.config)
-        rescue K8s::Error::API => e
-          raise ::Providers::ProviderError, "Failed to start pod: #{e.message}"
+          Rails.logger.info "[K8s] Cannot start worker #{worker.id} individually - managed by Deployment"
         end
 
-        # Stop a worker pod (scale to 0 but preserve definition)
-        # @param worker [Worker] The worker to stop
         def stop_worker(worker)
-          Rails.logger.info "[K8s] Stopping worker #{worker.id}"
-
-          pod_name = worker.machine.uid
-          namespace = k8s_namespace
-
-          # Delete the pod (deployment will handle recreation if needed)
-          client = k8s_client
-          client.api('v1').resource('pods', namespace: namespace).delete(pod_name, propagationPolicy: 'Foreground')
-
-          worker.machine.update(state: 'stopped')
-        rescue K8s::Error::NotFound
-          Rails.logger.warn "[K8s] Pod #{pod_name} already deleted"
-        rescue K8s::Error::API => e
-          raise ::Providers::ProviderError, "Failed to stop pod: #{e.message}"
+          Rails.logger.info "[K8s] Cannot stop worker #{worker.id} individually - managed by Deployment"
         end
 
-        # Suspend a worker pod (not supported, falls back to stop)
-        # @param worker [Worker] The worker to suspend
         def suspend_worker(worker)
-          Rails.logger.info "[K8s] Suspending worker #{worker.id} (using stop)"
-          stop_worker(worker)
+          Rails.logger.info "[K8s] Suspend not supported for Kubernetes workers"
         end
 
-        # Destroy a worker pod permanently
-        # @param worker [Worker] The worker to destroy
         def destroy_worker(worker)
-          Rails.logger.info "[K8s] Destroying worker #{worker.id}"
-
-          pod_name = worker.machine.uid
-          namespace = k8s_namespace
-
-          client = k8s_client
-          client.api('v1').resource('pods', namespace: namespace).delete(
-            pod_name,
-            propagationPolicy: 'Foreground',
-            gracePeriodSeconds: 30
-          )
-
-          worker.machine.update(state: 'terminated', finished_at: Time.current)
-        rescue K8s::Error::NotFound
-          Rails.logger.warn "[K8s] Pod #{pod_name} already deleted"
-        rescue K8s::Error::API => e
-          Rails.logger.error "[K8s] Failed to destroy pod: #{e.message}"
-          # Continue even if deletion fails
+          worker.de_register! unless worker.finished?
+          Rails.logger.info "[K8s] Worker #{worker.id} de-registered"
         end
 
-        # Reconcile workers - clean up orphaned pods
         def reconcile_workers
           Rails.logger.info "[K8s] Reconciling workers for project #{project.id}"
-
-          namespace = k8s_namespace
-          client = k8s_client
-
-          # Find all pods with project label
-          pods = client.api('v1').resource('pods', namespace: namespace).list(
-            labelSelector: "brisk-project-id=#{project.id},brisk-role=worker"
-          )
-
-          # Get all known machines
-          known_uids = project.machines.where(provider: 'kubernetes').pluck(:uid)
-
-          # Delete orphaned pods
-          orphaned = pods.reject { |pod| known_uids.include?(pod.metadata.name) }
-          orphaned.each do |pod|
-            Rails.logger.info "[K8s] Deleting orphaned pod: #{pod.metadata.name}"
-            client.api('v1').resource('pods', namespace: namespace).delete(
-              pod.metadata.name,
-              propagationPolicy: 'Background'
-            )
-          end
-
-          Rails.logger.info "[K8s] Reconciliation complete: #{orphaned.size} orphaned pods deleted"
-        rescue K8s::Error::API => e
-          Rails.logger.error "[K8s] Reconciliation failed: #{e.message}"
+          heal_stuck_workers(nil)
+          Rails.logger.info "[K8s] Reconciliation complete for project #{project.id}"
         end
 
-        # Feature support
-        # @param feature [Symbol] Feature name
-        # @return [Boolean] Whether feature is supported
         def supports?(feature)
-          # Can create pods on-demand and use HPA (Horizontal Pod Autoscaler)
-          %i[dynamic_creation auto_scale].include?(feature)
+          case feature
+          when :self_registration then true
+          else false
+          end
         end
 
-        # Called after workers are allocated
-        # @param workers [Array<Worker>] Allocated workers
         def after_worker_allocated(workers)
-          Rails.logger.debug "[K8s] #{workers.size} workers allocated, no balancing needed"
-          # Kubernetes handles scheduling and balancing
+          Rails.logger.debug "[K8s] #{workers.size} workers allocated"
+          project.balance_workers
         end
 
-        # Called after a worker is freed
-        # @param worker [Worker] The freed worker
         def after_worker_freed(worker)
-          Rails.logger.info "[K8s] Scheduling cleanup for worker #{worker.id}"
-          # Schedule cleanup after a delay to allow for reuse
-          # CleanupKubernetesWorkerJob.set(wait: 5.minutes).perform_later(worker.id)
-
-          # For now, just log - pods will be cleaned up by reconciliation
+          Rails.logger.debug "[K8s] Worker #{worker.id} freed"
         end
 
-        # Should Brisk track health for this worker?
-        # Kubernetes manages pod health via liveness/readiness probes
-        # @param worker [Worker] The worker
-        # @return [Boolean] false - Kubernetes manages health
         def should_track_health?(_worker)
-          false
+          false # K8s manages pod health via probes
         end
 
-        # Register worker metadata when worker registers via gRPC
-        # @param worker [Worker] The worker
-        # @param params [Hash] Registration parameters
-        # @return [Hash] Metadata to set on worker
         def register_worker_metadata(_worker, _params)
-          {
-            last_checked_at: 10.years.from_now # Kubernetes manages health
-          }
+          { last_checked_at: 10.years.from_now }
         end
 
-        # Does this provider manage this machine?
-        # @param machine [Machine] The machine
-        # @return [Boolean] true if machine is a Kubernetes pod
         def manages_machine?(machine)
-          machine.provider == 'kubernetes'
+          machine.provider == "kubernetes" || machine.provider.blank?
         end
 
         private
 
-        # Get Kubernetes client
-        # @return [K8s::Client] Kubernetes client
-        def k8s_client
-          @k8s_client ||= begin
-            config = k8s_config
-            K8s::Client.config(config)
-          end
-        end
+        # Core auto-healing: check K8s pod health and reset stuck DB records
+        def heal_stuck_workers(jobrun)
+          Rails.logger.info "[K8s] Checking for stuck workers to heal"
 
-        # Get Kubernetes configuration
-        # @return [K8s::Config] Kubernetes configuration
-        def k8s_config
-          # Try in-cluster config first (for running inside Kubernetes)
-          if in_cluster?
-            K8s::Config.load_file('/var/run/secrets/kubernetes.io/serviceaccount/token')
-          else
-            # Use kubeconfig for local development
-            kubeconfig_path = ENV['KUBECONFIG'] || File.expand_path('~/.kube/config')
-            K8s::Config.load_file(kubeconfig_path)
+          running_pod_ips = fetch_running_pod_ips
+          if running_pod_ips.nil?
+            Rails.logger.warn "[K8s] Could not fetch pod status from K8s API, skipping heal"
+            return
           end
+
+          Rails.logger.info "[K8s] Found #{running_pod_ips.size} running worker pods: #{running_pod_ips}"
+
+          healed = 0
+          worker_image = jobrun&.worker_image || project.image&.name
+
+          # Find workers that are stuck (not usable by the normal scopes)
+          stuck_workers = project.workers
+                                 .where.not(state: "active")
+                                 .or(project.workers.where(freed_at: nil))
+
+          stuck_workers.includes(:machine).each do |worker|
+            next unless worker.machine
+
+            pod_ip = worker.ip_address || worker.machine.ip_address
+            next unless running_pod_ips.include?(pod_ip)
+
+            # Pod is healthy but worker record is stuck - reset it
+            if worker.state == "finished" || (worker.state == "assigned" && worker.freed_at.nil? && worker.jobrun_id.present?)
+              Rails.logger.info "[K8s] Healing stuck worker #{worker.id}: state=#{worker.state} freed_at=#{worker.freed_at} jobrun=#{worker.jobrun_id}"
+
+              worker.update_columns(
+                state: "active",
+                freed_at: Time.current,
+                supervisor_id: nil,
+                jobrun_id: nil,
+                assigned_ram: 0,
+                reserved_at: nil,
+                last_checked_at: 10.years.from_now
+              )
+              healed += 1
+            elsif worker.last_checked_at.present? && worker.last_checked_at < 2.minutes.ago
+              # Worker is active but marked stale even though pod is running
+              Rails.logger.info "[K8s] Refreshing stale worker #{worker.id}: last_checked_at=#{worker.last_checked_at}"
+              worker.update_columns(last_checked_at: 10.years.from_now)
+              healed += 1
+            end
+          end
+
+          # Also heal workers with no project that match (unassigned workers)
+          if worker_image
+            unassigned_stuck = Worker.where(project_id: nil)
+                                     .where(state: "finished")
+                                     .with_worker_image(worker_image)
+
+            unassigned_stuck.includes(:machine).each do |worker|
+              next unless worker.machine
+
+              pod_ip = worker.ip_address || worker.machine.ip_address
+              next unless running_pod_ips.include?(pod_ip)
+
+              Rails.logger.info "[K8s] Healing stuck unassigned worker #{worker.id}"
+              worker.update_columns(
+                state: "active",
+                freed_at: Time.current,
+                supervisor_id: nil,
+                jobrun_id: nil,
+                assigned_ram: 0,
+                reserved_at: nil,
+                last_checked_at: 10.years.from_now
+              )
+              healed += 1
+            end
+          end
+
+          Rails.logger.info "[K8s] Healed #{healed} stuck workers" if healed > 0
         rescue StandardError => e
-          raise ::Providers::ConfigurationError, "Failed to load Kubernetes config: #{e.message}"
+          Rails.logger.error "[K8s] Error during heal_stuck_workers: #{e.message}"
+          Rails.logger.error e.backtrace&.first(5)&.join("\n")
+          # Don't fail the whole request - just skip healing
         end
 
-        # Check if running inside Kubernetes cluster
-        # @return [Boolean] true if running in-cluster
-        def in_cluster?
-          File.exist?('/var/run/secrets/kubernetes.io/serviceaccount/token')
-        end
-
-        # Get Kubernetes namespace for this project
-        # @return [String] Namespace name
-        def k8s_namespace
-          project.provider_config['namespace'] || ENV['K8S_NAMESPACE'] || 'brisk-workers'
-        end
-
-        # Validate provider configuration
-        # @raise [Providers::ConfigurationError] if configuration is invalid
-        def validate_config!
-          # Ensure namespace exists or can be created
+        # Query K8s API for running worker pod IPs
+        def fetch_running_pod_ips
           namespace = k8s_namespace
+          label_selector = pod_label_selector
 
-          raise ::Providers::ConfigurationError, 'Kubernetes namespace not configured' unless namespace.present?
+          uri = URI("#{K8S_API_HOST}/api/v1/namespaces/#{namespace}/pods?labelSelector=#{CGI.escape(label_selector)}")
 
-          # Validate image is configured
-          return if project.image&.url.present?
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = true
 
-          raise ::Providers::ConfigurationError, 'Worker image not configured'
+          if File.exist?(CA_PATH)
+            http.ca_file = CA_PATH
+            http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+          else
+            http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+          end
+
+          request = Net::HTTP::Get.new(uri)
+          request["Authorization"] = "Bearer #{k8s_token}"
+          request["Accept"] = "application/json"
+
+          response = http.request(request)
+
+          unless response.is_a?(Net::HTTPSuccess)
+            Rails.logger.error "[K8s] API request failed: #{response.code} #{response.body&.first(200)}"
+            return nil
+          end
+
+          data = JSON.parse(response.body)
+          pods = data["items"] || []
+
+          running_ips = pods.filter_map do |pod|
+            phase = pod.dig("status", "phase")
+            pod_ip = pod.dig("status", "podIP")
+
+            if phase == "Running" && pod_ip.present?
+              pod_ip
+            end
+          end
+
+          running_ips
+        rescue StandardError => e
+          Rails.logger.error "[K8s] Failed to fetch pod IPs: #{e.class} #{e.message}"
+          nil
+        end
+
+        def k8s_token
+          @k8s_token ||= if File.exist?(TOKEN_PATH)
+                            File.read(TOKEN_PATH).strip
+                          else
+                            ENV["K8S_TOKEN"]
+                          end
+        end
+
+        def k8s_namespace
+          @k8s_namespace ||= project.provider_config&.dig("namespace") ||
+                             (File.exist?(NAMESPACE_PATH) ? File.read(NAMESPACE_PATH).strip : nil) ||
+                             ENV["K8S_NAMESPACE"] ||
+                             "brisk-staging"
+        end
+
+        def pod_label_selector
+          project.provider_config&.dig("pod_label_selector") || "app=worker"
         end
       end
     end

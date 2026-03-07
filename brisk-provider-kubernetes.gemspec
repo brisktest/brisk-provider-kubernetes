@@ -24,7 +24,6 @@ Gem::Specification.new do |spec|
   spec.require_paths = ['lib']
 
   # Runtime dependencies
-  spec.add_dependency 'k8s-ruby', '~> 0.10' # Kubernetes client library
   spec.add_dependency 'rails', '>= 7.0'
 
   # Development dependencies
