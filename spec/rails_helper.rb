@@ -114,6 +114,7 @@ end
 
 # Load the provider library
 require 'brisk-provider-kubernetes'
+require 'brisk/providers/kubernetes/provider'
 
 # Define minimal ActiveRecord models for testing
 # Stub ProjectService for provider delegation
