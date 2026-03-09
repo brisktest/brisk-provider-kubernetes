@@ -98,6 +98,16 @@ module Providers
       # Hook for post-free logic
     end
 
+    def claim_supervisor(supervisor); end
+
+    def release_supervisor(supervisor)
+      supervisor.in_use = nil
+    end
+
+    def cleanup_supervisor(supervisor); end
+
+    def after_supervisor_released(supervisor); end
+
     def should_track_health?(_worker)
       true
     end

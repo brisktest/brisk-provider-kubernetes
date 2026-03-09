@@ -192,4 +192,62 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
       provider.after_worker_freed(worker)
     end
   end
+
+  describe '#claim_supervisor' do
+    it 'logs that supervisor pod is always running' do
+      supervisor = double('Supervisor', id: 1)
+      expect(logger).to receive(:debug).with(/claimed.*always running/)
+
+      provider.claim_supervisor(supervisor)
+    end
+  end
+
+  describe '#release_supervisor' do
+    it 'clears in_use on the supervisor' do
+      supervisor = double('Supervisor', id: 1, in_use: Time.current)
+      expect(supervisor).to receive(:in_use=).with(nil)
+
+      provider.release_supervisor(supervisor)
+    end
+  end
+
+  describe '#after_supervisor_released' do
+    it 'frees workers still assigned to the supervisor' do
+      worker = double('Worker', id: 1)
+      workers_relation = double('WorkersRelation')
+      supervisor = double('Supervisor', id: 1, workers: workers_relation)
+      allow(workers_relation).to receive(:where).with(freed_at: nil).and_return([worker])
+      expect(worker).to receive(:free_from_super)
+
+      provider.after_supervisor_released(supervisor)
+    end
+
+    it 'handles errors when freeing workers' do
+      worker = double('Worker', id: 1)
+      workers_relation = double('WorkersRelation')
+      supervisor = double('Supervisor', id: 1, workers: workers_relation)
+      allow(workers_relation).to receive(:where).with(freed_at: nil).and_return([worker])
+      allow(worker).to receive(:free_from_super).and_raise(StandardError, 'test error')
+      expect(logger).to receive(:error).with(/Failed to free worker/)
+
+      expect { provider.after_supervisor_released(supervisor) }.not_to raise_error
+    end
+
+    it 'does nothing when no busy workers remain' do
+      workers_relation = double('WorkersRelation')
+      supervisor = double('Supervisor', id: 1, workers: workers_relation)
+      allow(workers_relation).to receive(:where).with(freed_at: nil).and_return([])
+
+      expect { provider.after_supervisor_released(supervisor) }.not_to raise_error
+    end
+  end
+
+  describe '#cleanup_supervisor' do
+    it 'logs that pod lifecycle is managed by Kubernetes' do
+      supervisor = double('Supervisor', id: 1)
+      expect(logger).to receive(:debug).with(/managed by Kubernetes/)
+
+      provider.cleanup_supervisor(supervisor)
+    end
+  end
 end

@@ -50,6 +50,30 @@ module Brisk
           project.balance_workers
         end
 
+        def claim_supervisor(supervisor)
+          Rails.logger.debug "[K8s] Supervisor #{supervisor.id} claimed, pod is always running"
+        end
+
+        def release_supervisor(supervisor)
+          supervisor.in_use = nil
+        end
+
+        def after_supervisor_released(supervisor)
+          # Free any workers still assigned to this supervisor as a safety net.
+          # Workers are normally freed during log_run, but this handles edge cases
+          # (e.g., worker log_run failed, or worker was stuck in assigned state).
+          # Runs outside the supervisor transaction to avoid nested locking.
+          supervisor.workers.where(freed_at: nil).each do |worker|
+            worker.free_from_super
+          rescue => e
+            Rails.logger.error "[K8s] Failed to free worker #{worker.id} during supervisor release: #{e.message}"
+          end
+        end
+
+        def cleanup_supervisor(supervisor)
+          Rails.logger.debug "[K8s] Supervisor #{supervisor.id} de-registered, pod lifecycle managed by Kubernetes"
+        end
+
         def after_worker_freed(worker)
           Rails.logger.debug "[K8s] Worker #{worker.id} freed"
         end
