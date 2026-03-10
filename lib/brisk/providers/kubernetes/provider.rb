@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'kube_client'
+
 module Brisk
   module Providers
     module Kubernetes
@@ -14,7 +16,7 @@ module Brisk
 
         def create_worker(_machine_config)
           raise ::Providers::UnsupportedOperationError,
-                "Kubernetes workers are managed by the cluster Deployment. Scale the workers Deployment instead."
+                'Kubernetes workers are managed by the cluster Deployment. Scale the workers Deployment instead.'
         end
 
         def start_worker(worker)
@@ -25,8 +27,8 @@ module Brisk
           Rails.logger.info "[K8s] Cannot stop worker #{worker.id} individually - managed by Deployment"
         end
 
-        def suspend_worker(worker)
-          Rails.logger.info "[K8s] Suspend not supported for Kubernetes workers"
+        def suspend_worker(_worker)
+          Rails.logger.info '[K8s] Suspend not supported for Kubernetes workers'
         end
 
         def destroy_worker(worker)
@@ -35,7 +37,55 @@ module Brisk
         end
 
         def reconcile_workers
-          Rails.logger.info "[K8s] Reconciliation is handled by Kubernetes - no action needed"
+          unless KubeClient.in_cluster?
+            Rails.logger.info '[K8s] Not running in a Kubernetes cluster, skipping reconciliation'
+            return
+          end
+
+          namespace = resolve_namespace
+          Rails.logger.info "[K8s] Reconciling workers for project #{project.id} in namespace #{namespace}"
+
+          begin
+            client = KubeClient.new
+            pods = client.list_pods(namespace: namespace, label_selector: resolve_pod_selector)
+          rescue KubeApiError => e
+            Rails.logger.warn "[K8s] Cannot reconcile — K8s API unavailable: #{e.message}"
+            return
+          end
+
+          running_pod_names = Set.new(
+            pods.reject { |p| %w[Failed Succeeded].include?(p[:status]) }
+                .map { |p| p[:name] }
+          )
+
+          k8s_workers = project.workers
+                               .where.not(state: 'finished')
+                               .joins(:machine)
+                               .where(machines: { provider: 'kubernetes' })
+                               .includes(:machine)
+
+          ghost_freed = 0
+          stale_deregistered = 0
+
+          k8s_workers.each do |worker|
+            next if worker.machine.nil?
+            next if running_pod_names.include?(worker.machine.uid)
+
+            if worker.freed_at.nil? && worker.reserved_at.present? && worker.reserved_at < 5.minutes.ago
+              Rails.logger.info "[K8s] Freeing ghost worker #{worker.id} (pod #{worker.machine.uid} not found)"
+              worker.free_from_super
+              ghost_freed += 1
+            elsif worker.freed_at.present? && worker.freed_at < 10.minutes.ago
+              Rails.logger.info "[K8s] De-registering stale worker #{worker.id} (pod #{worker.machine.uid} not found)"
+              worker.de_register! unless worker.finished?
+              stale_deregistered += 1
+            end
+          rescue StandardError => e
+            Rails.logger.error "[K8s] Error reconciling worker #{worker.id}: #{e.message}"
+          end
+
+          Rails.logger.info "[K8s] Reconciliation complete for project #{project.id}: " \
+                            "freed #{ghost_freed} ghost workers, de-registered #{stale_deregistered} stale workers"
         end
 
         def supports?(feature)
@@ -46,8 +96,7 @@ module Brisk
         end
 
         def after_worker_allocated(workers)
-          Rails.logger.debug "[K8s] #{workers.size} workers allocated"
-          project.balance_workers
+          Rails.logger.debug "[K8s] #{workers.size} workers allocated, pod count managed by Deployment"
         end
 
         def claim_supervisor(supervisor)
@@ -58,16 +107,8 @@ module Brisk
           supervisor.in_use = nil
         end
 
-        def after_supervisor_released(supervisor)
-          # Free any workers still assigned to this supervisor as a safety net.
-          # Workers are normally freed during log_run, but this handles edge cases
-          # (e.g., worker log_run failed, or worker was stuck in assigned state).
-          # Runs outside the supervisor transaction to avoid nested locking.
-          supervisor.workers.where(freed_at: nil).each do |worker|
-            worker.free_from_super
-          rescue => e
-            Rails.logger.error "[K8s] Failed to free worker #{worker.id} during supervisor release: #{e.message}"
-          end
+        def provider_log_prefix
+          'K8s'
         end
 
         def cleanup_supervisor(supervisor)
@@ -87,7 +128,18 @@ module Brisk
         end
 
         def manages_machine?(machine)
-          machine.provider == "kubernetes" || machine.provider.blank?
+          machine.provider == 'kubernetes'
+        end
+
+        private
+
+        def resolve_namespace
+          (project.provider_config || {})['namespace'] ||
+            ENV.fetch('K8S_NAMESPACE', 'brisk-staging')
+        end
+
+        def resolve_pod_selector
+          (project.provider_config || {})['pod_label_selector'] || 'app=worker'
         end
       end
     end

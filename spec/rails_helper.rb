@@ -106,7 +106,18 @@ module Providers
 
     def cleanup_supervisor(supervisor); end
 
-    def after_supervisor_released(supervisor); end
+    def after_supervisor_released(supervisor)
+      supervisor.workers.where(freed_at: nil).each do |worker|
+        worker.free_from_super
+      rescue StandardError => e
+        Rails.logger.error "[#{provider_log_prefix}] Failed to free worker #{worker.id} " \
+                           "during supervisor release: #{e.message}"
+      end
+    end
+
+    def provider_log_prefix
+      'Base'
+    end
 
     def should_track_health?(_worker)
       true
@@ -129,7 +140,7 @@ require 'brisk/providers/kubernetes/provider'
 # Define minimal ActiveRecord models for testing
 # Stub ProjectService for provider delegation
 class ProjectService
-  def self.get_workers_for_project(jobrun)
+  def self.get_workers_for_project(_jobrun)
     []
   end
 end
@@ -159,6 +170,8 @@ class Worker < ActiveRecord::Base
   belongs_to :project
   belongs_to :machine, optional: true
 
+  scope :busy, -> { where(freed_at: nil) }
+
   def de_register!
     update!(state: 'finished')
   end
@@ -166,10 +179,24 @@ class Worker < ActiveRecord::Base
   def finished?
     state == 'finished'
   end
+
+  def free_from_super
+    return nil if freed_at.present?
+    return nil unless state == 'assigned'
+
+    update!(
+      supervisor_id: nil,
+      freed_at: Time.current,
+      assigned_ram: 0,
+      reserved_at: nil,
+      jobrun_id: nil
+    )
+  end
 end
 
 class Machine < ActiveRecord::Base
-  belongs_to :project
+  belongs_to :project, optional: true
+  has_many :workers
 end
 
 # Create database schema
@@ -184,7 +211,12 @@ ActiveRecord::Schema.define do
   create_table :workers, force: true do |t|
     t.integer :project_id
     t.integer :machine_id
+    t.integer :supervisor_id
+    t.integer :jobrun_id
+    t.integer :assigned_ram, default: 0
     t.string :state, default: 'active'
+    t.datetime :freed_at
+    t.datetime :reserved_at
     t.timestamps
   end
 
