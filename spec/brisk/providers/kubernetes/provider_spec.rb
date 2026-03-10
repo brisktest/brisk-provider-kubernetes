@@ -42,10 +42,12 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   describe '#get_workers_for_project' do
     it 'delegates to ProjectService' do
       jobrun = double('Jobrun')
-      expect(ProjectService).to receive(:get_workers_for_project).with(jobrun).and_return([])
+      allow(ProjectService).to receive(:get_workers_for_project).with(jobrun).and_return([])
 
       result = provider.get_workers_for_project(jobrun)
+
       expect(result).to eq([])
+      expect(ProjectService).to have_received(:get_workers_for_project).with(jobrun)
     end
   end
 
@@ -109,10 +111,122 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
   end
 
   describe '#reconcile_workers' do
-    it 'logs that reconciliation is handled by Kubernetes' do
-      expect(logger).to receive(:info).with(/handled by Kubernetes/)
+    let(:kube_client) { instance_double(Brisk::Providers::Kubernetes::KubeClient) }
 
-      provider.reconcile_workers
+    context 'when not in a Kubernetes cluster' do
+      before do
+        allow(Brisk::Providers::Kubernetes::KubeClient).to receive(:in_cluster?).and_return(false)
+      end
+
+      it 'skips reconciliation' do
+        expect(logger).to receive(:info).with(/Not running in a Kubernetes cluster/)
+
+        provider.reconcile_workers
+      end
+    end
+
+    context 'when K8s API is unavailable' do
+      before do
+        allow(Brisk::Providers::Kubernetes::KubeClient).to receive(:in_cluster?).and_return(true)
+        allow(Brisk::Providers::Kubernetes::KubeClient).to receive(:new).and_raise(
+          Brisk::Providers::Kubernetes::KubeApiError, 'connection refused'
+        )
+      end
+
+      it 'logs a warning and returns gracefully' do
+        expect(logger).to receive(:warn).with(/K8s API unavailable/)
+
+        expect { provider.reconcile_workers }.not_to raise_error
+      end
+    end
+
+    context 'when in a Kubernetes cluster' do
+      let!(:running_machine) { create(:machine, provider: 'kubernetes', uid: 'worker-pod-abc') }
+      let!(:ghost_machine) { create(:machine, provider: 'kubernetes', uid: 'worker-pod-gone') }
+      let!(:stale_machine) { create(:machine, provider: 'kubernetes', uid: 'worker-pod-old') }
+
+      let!(:running_worker) do
+        create(:worker, project: project, machine: running_machine, state: 'assigned',
+                        freed_at: nil, reserved_at: 2.minutes.ago, supervisor_id: 1)
+      end
+
+      let!(:ghost_worker) do
+        create(:worker, project: project, machine: ghost_machine, state: 'assigned',
+                        freed_at: nil, reserved_at: 10.minutes.ago, supervisor_id: 1)
+      end
+
+      let!(:stale_free_worker) do
+        create(:worker, project: project, machine: stale_machine, state: 'assigned',
+                        freed_at: 15.minutes.ago, reserved_at: nil)
+      end
+
+      before do
+        allow(Brisk::Providers::Kubernetes::KubeClient).to receive_messages(in_cluster?: true, new: kube_client)
+        pods_response = [
+          { name: 'worker-pod-abc', status: 'Running', ip: '10.0.0.1' },
+          { name: 'worker-pod-new', status: 'Running', ip: '10.0.0.2' }
+        ]
+        allow(kube_client).to receive(:list_pods).and_return(pods_response)
+      end
+
+      it 'frees ghost busy workers whose pods are gone' do
+        provider.reconcile_workers
+
+        ghost_worker.reload
+        expect(ghost_worker.freed_at).not_to be_nil
+        expect(ghost_worker.supervisor_id).to be_nil
+      end
+
+      it 'de-registers stale free workers whose pods are gone' do
+        provider.reconcile_workers
+
+        stale_free_worker.reload
+        expect(stale_free_worker.state).to eq('finished')
+      end
+
+      it 'does not touch workers whose pods are still running' do
+        provider.reconcile_workers
+
+        running_worker.reload
+        expect(running_worker.state).to eq('assigned')
+        expect(running_worker.freed_at).to be_nil
+      end
+
+      it 'does not touch recently assigned ghost workers (within 5 min threshold)' do
+        recent_machine = create(:machine, provider: 'kubernetes', uid: 'worker-pod-recent-gone')
+        recent_ghost = create(:worker, project: project, machine: recent_machine, state: 'assigned',
+                                       freed_at: nil, reserved_at: 2.minutes.ago, supervisor_id: 1)
+
+        provider.reconcile_workers
+
+        recent_ghost.reload
+        expect(recent_ghost.state).to eq('assigned')
+        expect(recent_ghost.freed_at).to be_nil
+      end
+
+      it 'logs a summary of actions taken' do
+        expect(logger).to receive(:info).with(/Reconciliation complete.*freed 1 ghost.*de-registered 1 stale/)
+
+        provider.reconcile_workers
+      end
+
+      it 'uses the namespace from provider_config' do
+        allow(kube_client).to receive(:list_pods).and_return([])
+
+        provider.reconcile_workers
+
+        expect(kube_client).to have_received(:list_pods).with(
+          namespace: 'brisk-test',
+          label_selector: 'app=worker'
+        )
+      end
+
+      it 'continues reconciliation even if one worker fails' do
+        allow_any_instance_of(Worker).to receive(:free_from_super).and_raise(StandardError, 'lock timeout') # rubocop:disable RSpec/AnyInstance
+        expect(logger).to receive(:error).with(/Error reconciling worker/)
+
+        expect { provider.reconcile_workers }.not_to raise_error
+      end
     end
   end
 
@@ -157,9 +271,9 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
       expect(provider.manages_machine?(machine)).to be true
     end
 
-    it 'returns true for machines with blank provider' do
+    it 'returns false for machines with blank provider' do
       machine = create(:machine, provider: '')
-      expect(provider.manages_machine?(machine)).to be true
+      expect(provider.manages_machine?(machine)).to be false
     end
 
     it 'returns false for other provider machines' do
@@ -176,9 +290,9 @@ RSpec.describe Brisk::Providers::Kubernetes::Provider do
       provider.after_worker_allocated(workers)
     end
 
-    it 'calls balance_workers on the project' do
+    it 'does not call balance_workers (pod count managed by Deployment)' do
       workers = [create(:worker, project: project)]
-      expect(project).to receive(:balance_workers)
+      expect(project).not_to receive(:balance_workers)
 
       provider.after_worker_allocated(workers)
     end
