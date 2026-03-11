@@ -1,16 +1,40 @@
 # Brisk Provider: Kubernetes
 
-Run Brisk CI workers as Kubernetes pods in your cluster. This provider manages the full lifecycle of worker pods, from creation to cleanup.
+Run Brisk CI workers as Kubernetes pods in your cluster. Workers are managed by a Kubernetes Deployment and self-register with the Brisk API via gRPC. This provider handles reconciliation and supervisor lifecycle — **not** individual pod creation.
 
 ## Features
 
-- ✅ **Dynamic Pod Creation** - Automatically creates worker pods on-demand
-- ✅ **Auto-scaling** - Works with Kubernetes Horizontal Pod Autoscaler
-- ✅ **Health Management** - Uses Kubernetes liveness and readiness probes
-- ✅ **Resource Limits** - Configurable CPU and memory requests/limits
-- ✅ **Node Selection** - Support for node selectors and tolerations
-- ✅ **Namespace Isolation** - Run workers in dedicated namespaces
-- ✅ **Orphan Cleanup** - Automatic reconciliation of orphaned pods
+- ✅ **Self-Registration** — Worker pods register themselves via gRPC on startup
+- ✅ **Deployment-Managed Pods** — Kubernetes Deployment controls pod lifecycle and scaling
+- ✅ **Ghost Worker Reconciliation** — Detects and cleans up workers whose pods have disappeared
+- ✅ **Health Delegation** — Kubernetes probes manage pod health; Brisk skips internal health tracking
+- ✅ **Namespace Isolation** — Run workers in dedicated namespaces
+- ✅ **Supervisor Management** — Lightweight supervisor lifecycle (pods always running)
+- ✅ **Auto-Registration** — Provider auto-registers via Rails Engine when gem is loaded
+
+## Architecture
+
+```
+brisk-provider-kubernetes/
+├── lib/brisk/providers/kubernetes/
+│   ├── provider.rb      # Provider implementation (inherits BaseProvider)
+│   ├── kube_client.rb   # Lightweight in-cluster K8s API client
+│   └── engine.rb        # Rails Engine for auto-registration
+├── examples/
+│   ├── kubernetes-rbac.yaml
+│   └── project-configuration.rb
+└── spec/
+```
+
+### Provider → KubeClient → Kubernetes API
+
+```
+Provider (provider.rb)
+  └─> KubeClient (kube_client.rb)
+      └─> Kubernetes API (in-cluster, service account auth)
+```
+
+`KubeClient` is a lightweight HTTP client that uses the pod's service account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`) to authenticate. It only supports read operations needed for reconciliation (listing pods).
 
 ## Installation
 
@@ -32,38 +56,30 @@ Then execute:
 bundle install
 ```
 
-The provider will auto-register when Rails boots.
+The provider auto-registers when Rails boots via the Engine initializer.
 
 ## Configuration
 
 ### Prerequisites
 
-1. **Kubernetes Cluster** - You need a running Kubernetes cluster
-2. **kubectl Access** - Configured kubeconfig or in-cluster service account
-3. **Namespace** - Create a namespace for Brisk workers:
+1. **Kubernetes Cluster** — A running cluster with a worker Deployment
+2. **In-Cluster Access** — The Brisk API must run as a pod with a service account
+3. **Namespace** — Create a namespace for Brisk workers:
 
 ```bash
-kubectl create namespace brisk-workers
+kubectl create namespace brisk-staging
 ```
 
 ### Environment Variables
 
-**For local development (using kubeconfig):**
 ```bash
-KUBECONFIG=/path/to/kubeconfig
-K8S_NAMESPACE=brisk-workers  # Optional, defaults to brisk-workers
-BRISK_API_ENDPOINT=api.brisk.dev:443
-```
-
-**For in-cluster deployment (using service account):**
-```bash
-K8S_NAMESPACE=brisk-workers  # Optional
+K8S_NAMESPACE=brisk-staging        # Optional, defaults to brisk-staging
 BRISK_API_ENDPOINT=api.brisk.dev:443
 ```
 
 ### RBAC Permissions
 
-The Brisk API needs these Kubernetes permissions:
+The Brisk API pod needs read access to worker pods for reconciliation:
 
 ```yaml
 apiVersion: v1
@@ -76,20 +92,22 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: brisk-worker-manager
-  namespace: brisk-workers
+  namespace: brisk-staging
 rules:
+# Required for reconciliation (KubeClient.list_pods)
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "list", "watch", "create", "delete"]
+  verbs: ["get", "list", "watch"]
+# Optional: for debugging
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind:RoleBinding
+kind: RoleBinding
 metadata:
   name: brisk-api-worker-manager
-  namespace: brisk-workers
+  namespace: brisk-staging
 subjects:
 - kind: ServiceAccount
   name: brisk-api
@@ -105,94 +123,146 @@ Apply with:
 kubectl apply -f rbac.yaml
 ```
 
-### Project Configuration
+See `examples/kubernetes-rbac.yaml` for a complete RBAC configuration including NetworkPolicy and ResourceQuota.
 
-Create a project using the Kubernetes provider:
+### Project Configuration
 
 ```ruby
 project = Project.create!(
   name: "My K8s Project",
   worker_provider: 'kubernetes',
   provider_config: {
-    # Required
-    'namespace' => 'brisk-workers',
+    # Namespace where worker pods run (default: brisk-staging)
+    'namespace' => 'brisk-staging',
 
-    # Optional: Custom environment variables
-    'env' => {
-      'CUSTOM_VAR' => 'value',
-      'DEBUG' => 'true'
-    },
-
-    # Optional: Resource defaults
-    'default_memory_mb' => 4096,
-    'default_cpu_count' => 2,
-
-    # Optional: Node selection
-    'node_selector' => {
-      'workload-type' => 'ci'
-    },
-
-    # Optional: Tolerations for tainted nodes
-    'tolerations' => [
-      {
-        'key' => 'ci-workload',
-        'operator' => 'Equal',
-        'value' => 'true',
-        'effect' => 'NoSchedule'
-      }
-    ]
+    # Label selector for finding worker pods (default: app=worker)
+    'pod_label_selector' => 'app=worker'
   }
 )
 ```
 
-## Usage
+See `examples/project-configuration.rb` for advanced configuration examples.
 
-Once configured, the provider works automatically:
+## Worker Lifecycle
 
-```ruby
-# Start a test run
-jobrun = project.jobruns.create!(/* ... */)
+Workers are **not** created by this provider. They are managed by a Kubernetes Deployment and self-register with Brisk.
 
-# Provider automatically:
-# 1. Finds available worker pods
-# 2. Creates new pods if needed
-# 3. Allocates them to the jobrun
-# 4. Cleans up after tests complete
-
-# Check worker status
-project.workers.in_use.each do |worker|
-  puts "Worker #{worker.id}: #{worker.state}"
-  puts "  Pod: #{worker.machine.uid}"
-  puts "  Node: #{worker.machine.json_data['node_name']}"
-end
+```
+K8s Deployment creates pod
+  → Pod starts and self-registers via gRPC
+    → Worker record created in DB
+      → Worker allocated to jobrun
+        → Tests execute
+          → Worker freed
+            → Pod stays running (managed by Deployment)
 ```
 
-## Pod Configuration
+### Key Differences from Other Providers
 
-Worker pods are created with:
+| Operation | Fly.io / Self-Hosted | Kubernetes |
+|-----------|---------------------|------------|
+| `create_worker` | Creates a machine/pod | **Raises `UnsupportedOperationError`** |
+| `start_worker` | Starts the machine | Logs only (Deployment manages) |
+| `stop_worker` | Stops the machine | Logs only (Deployment manages) |
+| `destroy_worker` | Destroys the machine | De-registers the worker record |
+| Scaling | Provider manages | `kubectl scale deployment` |
+
+### Scaling Workers
+
+```bash
+# Scale up workers
+kubectl scale deployment brisk-worker -n brisk-staging --replicas=10
+
+# Scale down
+kubectl scale deployment brisk-worker -n brisk-staging --replicas=2
+```
+
+## Supervisor Management
+
+Supervisor pods in Kubernetes are always running (managed by a Deployment), so supervisor lifecycle is lightweight:
+
+```ruby
+claim_supervisor(supervisor)         # Logs that pod is always running
+release_supervisor(supervisor)       # Clears in_use
+cleanup_supervisor(supervisor)       # Logs that lifecycle is K8s-managed
+after_supervisor_released(supervisor) # Inherited: frees workers still assigned
+```
+
+Since pods are always running, there is no need to start/stop/suspend machines. The base class `after_supervisor_released` hook frees any workers still assigned to the supervisor.
+
+## Reconciliation
+
+The `reconcile_workers` method syncs Kubernetes pod state with the Brisk database. It runs periodically via `ReconcileWorkersJob`.
+
+### How It Works
+
+1. **Check environment** — Only runs when `KubeClient.in_cluster?` is true (service account token exists)
+2. **List pods** — Queries K8s API for running pods in the configured namespace with the configured label selector
+3. **Compare with DB** — Finds workers in DB whose pods no longer exist
+4. **Free ghost workers** — Workers reserved >5 minutes ago with missing pods are freed via `free_from_super`
+5. **De-register stale workers** — Workers freed >10 minutes ago with missing pods are de-registered (state → `finished`)
+6. **Error handling** — K8s API errors are caught gracefully; individual worker errors don't halt reconciliation
+
+### Thresholds
+
+| Condition | Threshold | Action |
+|-----------|-----------|--------|
+| Busy worker, pod gone | Reserved >5 min ago | `free_from_super` |
+| Free worker, pod gone | Freed >10 min ago | `de_register!` |
+
+## Provider Methods Reference
+
+### Worker Management
+
+```ruby
+get_workers_for_project(jobrun)  # Delegates to ProjectService
+create_worker(machine_config)    # Raises UnsupportedOperationError
+start_worker(worker)             # Logs only
+stop_worker(worker)              # Logs only
+suspend_worker(worker)           # Logs only
+destroy_worker(worker)           # De-registers worker
+reconcile_workers                # Syncs pod state with DB
+```
+
+### Supervisor Management
+
+```ruby
+claim_supervisor(supervisor)           # Logs (pod always running)
+release_supervisor(supervisor)         # Clears in_use
+cleanup_supervisor(supervisor)         # Logs (K8s manages lifecycle)
+after_supervisor_released(supervisor)  # Frees remaining workers (inherited)
+```
+
+### Configuration & Capabilities
+
+```ruby
+supports?(:self_registration)          # => true
+supports?(:anything_else)              # => false
+should_track_health?(worker)           # => false (K8s probes handle it)
+register_worker_metadata(worker, params) # Sets last_checked_at to 10 years ahead
+manages_machine?(machine)              # machine.provider == 'kubernetes'
+provider_log_prefix                    # => 'K8s'
+```
+
+### Health Management
+
+- Kubernetes manages pod health via liveness/readiness probes
+- `should_track_health?` returns `false` — Brisk skips internal health checks
+- `register_worker_metadata` sets `last_checked_at` to 10 years in the future to prevent Brisk's health checker from flagging K8s workers as stale
+
+## Recommended Deployment Configuration
+
+Worker pods should be configured in your Kubernetes Deployment with:
 
 ### Container Spec
-- **Image**: From `project.image.url`
-- **Ports**:
+- **Ports:**
   - 50051 (gRPC for worker communication)
   - 8081 (HTTP for health checks)
-- **Environment**:
+- **Environment:**
   - `BRISK_PROJECT_ID`
   - `BRISK_PROJECT_TOKEN`
   - `BRISK_API_ENDPOINT`
   - `WORKER_CONCURRENCY`
-  - Custom vars from `provider_config['env']`
-
-### Resources
-```yaml
-resources:
-  requests:
-    memory: "4096Mi"  # Configurable
-    cpu: "2"          # Configurable
-  limits:
-    memory: "6144Mi"  # 1.5x requests
-    cpu: "3"          # 1.5x requests
-```
 
 ### Health Checks
 ```yaml
@@ -212,59 +282,24 @@ readinessProbe:
 ```
 
 ### Labels
-All pods are labeled with:
-- `brisk-project-id: <project_id>`
-- `brisk-role: worker`
-- `app: brisk-worker`
-
-Use these labels for monitoring, network policies, etc.
+Ensure pods have labels matching your `pod_label_selector` (default: `app=worker`):
+```yaml
+metadata:
+  labels:
+    app: worker
+```
 
 ## Advanced Configuration
 
-### Custom Resource Limits
+### Custom Pod Selector
+
+If your worker pods use different labels:
 
 ```ruby
 project.update!(
   provider_config: {
-    'namespace' => 'brisk-workers',
-    'default_memory_mb' => 8192,  # 8GB RAM
-    'default_cpu_count' => 4       # 4 CPUs
-  }
-)
-```
-
-### Node Selection
-
-Run workers on specific nodes:
-
-```ruby
-project.update!(
-  provider_config: {
-    'namespace' => 'brisk-workers',
-    'node_selector' => {
-      'workload-type' => 'ci',
-      'disk-type' => 'ssd'
-    }
-  }
-)
-```
-
-### Tolerations
-
-Run on tainted nodes:
-
-```ruby
-project.update!(
-  provider_config: {
-    'namespace' => 'brisk-workers',
-    'tolerations' => [
-      {
-        'key' => 'ci-workload',
-        'operator' => 'Equal',
-        'value' => 'true',
-        'effect' => 'NoSchedule'
-      }
-    ]
+    'namespace' => 'brisk-staging',
+    'pod_label_selector' => 'role=brisk-worker,env=staging'
   }
 )
 ```
@@ -274,14 +309,12 @@ project.update!(
 Run different projects in different namespaces:
 
 ```ruby
-# Project 1 - staging environment
 project1 = Project.create!(
   name: "Staging Tests",
   worker_provider: 'kubernetes',
   provider_config: { 'namespace' => 'brisk-staging' }
 )
 
-# Project 2 - production environment
 project2 = Project.create!(
   name: "Production Tests",
   worker_provider: 'kubernetes',
@@ -295,74 +328,70 @@ project2 = Project.create!(
 
 ```bash
 # List all Brisk worker pods
-kubectl get pods -n brisk-workers -l app=brisk-worker
+kubectl get pods -n brisk-staging -l app=worker
 
 # Watch pod status
-kubectl get pods -n brisk-workers -l app=brisk-worker -w
+kubectl get pods -n brisk-staging -l app=worker -w
 
 # View logs
-kubectl logs -n brisk-workers <pod-name>
+kubectl logs -n brisk-staging <pod-name>
 ```
 
 ### Metrics
 
 Worker pods expose metrics on port 8081:
-- `/health` - Liveness check
-- `/ready` - Readiness check
-- `/metrics` - Prometheus metrics (if enabled)
+- `/health` — Liveness check
+- `/ready` — Readiness check
+- `/metrics` — Prometheus metrics (if enabled)
 
 ### Events
 
 ```bash
-# View pod events
-kubectl describe pod -n brisk-workers <pod-name>
-
-# Watch events
-kubectl get events -n brisk-workers -w
+kubectl describe pod -n brisk-staging <pod-name>
+kubectl get events -n brisk-staging -w
 ```
 
 ## Troubleshooting
 
 ### Pods Not Starting
 
-Check events:
 ```bash
-kubectl describe pod -n brisk-workers <pod-name>
+kubectl describe pod -n brisk-staging <pod-name>
 ```
 
 Common issues:
 - **ImagePullBackOff**: Check image URL and registry credentials
 - **Pending**: Check resource requests vs available node capacity
-- **CrashLoopBackOff**: Check pod logs for errors
+- **CrashLoopBackOff**: Check pod logs for startup errors
 
 ### Workers Not Connecting
 
 1. Check pod logs:
 ```bash
-kubectl logs -n brisk-workers <pod-name>
+kubectl logs -n brisk-staging <pod-name>
 ```
 
-2. Verify connectivity:
+2. Verify connectivity to the Brisk API:
 ```bash
-kubectl exec -n brisk-workers <pod-name> -- curl http://api.brisk.dev
+kubectl exec -n brisk-staging <pod-name> -- curl http://api.brisk.dev
 ```
 
 3. Check environment variables:
 ```bash
-kubectl exec -n brisk-workers <pod-name> -- env | grep BRISK
+kubectl exec -n brisk-staging <pod-name> -- env | grep BRISK
 ```
 
-### Orphaned Pods
+### Ghost Workers in DB
 
-The provider automatically cleans up orphaned pods via reconciliation. To manually clean up:
+If workers appear in the database but their pods are gone, reconciliation will clean them up automatically. To trigger manually:
 
-```bash
-# Delete all pods for a project
-kubectl delete pods -n brisk-workers -l brisk-project-id=<project_id>
-
-# Delete all Brisk worker pods
-kubectl delete pods -n brisk-workers -l app=brisk-worker
+```ruby
+project.provider.reconcile_workers
 ```
+
+### Reconciliation Not Running
+
+Reconciliation only runs when the Brisk API is deployed **inside** the Kubernetes cluster (checks for service account token at `/var/run/secrets/kubernetes.io/serviceaccount/token`). It will skip silently when running outside the cluster.
 
 ## Development
 
@@ -388,37 +417,7 @@ Enable debug logging:
 Rails.logger.level = :debug
 ```
 
-View provider logs:
-```ruby
-Rails.logger.tagged("K8s Provider") do
-  # Provider operations will be logged
-end
-```
-
-## Architecture
-
-### Provider → PodService → Kubernetes API
-
-```
-Provider (provider.rb)
-  └─> PodService (pod_service.rb)
-      └─> K8s Client (k8s-ruby gem)
-          └─> Kubernetes API
-```
-
-### Pod Lifecycle
-
-1. **Creation**: Provider creates pod via PodService
-2. **Registration**: Pod starts and registers via gRPC
-3. **Allocation**: Worker is allocated to jobrun
-4. **Execution**: Tests run on worker
-5. **Cleanup**: Pod is deleted after job completes
-
-### Health Management
-
-- Kubernetes manages pod health via probes
-- Brisk disables internal health tracking (sets `last_checked_at` to far future)
-- Dead pods are automatically restarted by Kubernetes
+Provider logs are prefixed with `[K8s]`.
 
 ## Contributing
 
@@ -433,3 +432,4 @@ The gem is available as open source under the terms of the [MIT License](https:/
 - Documentation: https://docs.brisk.dev/providers/kubernetes
 - Issues: https://github.com/brisktest/brisk-provider-kubernetes/issues
 - Discussions: https://github.com/brisktest/brisk/discussions
+
